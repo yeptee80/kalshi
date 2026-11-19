@@ -1,8 +1,14 @@
 
-"""Paper-only Kalshi execution.
+"""Kalshi paper-only trade execution.
 
-Simulates entries, resting limit bids, fills, quick-profit
-exits, fees, cash, and equity. Never submits exchange orders.
+Simulates:
+- Marketable entries
+- Resting limit bids
+- Position accounting
+- Fees and cash balances
+- Trailing-profit exits
+
+No real orders are submitted.
 """
 
 from __future__ import annotations
@@ -19,8 +25,10 @@ from kalshi_bot.strategies.base import Signal
 
 
 MODE = "paper"
-QUICK_PROFIT_TARGET = 0.20
-MIN_CONTRACTS = 1.0
+
+PROFIT_ACTIVATION = 0.20
+PROFIT_TRAIL = 0.05
+MIN_EXIT_PROFIT = 0.01
 
 
 @dataclass
@@ -45,14 +53,13 @@ class PaperFill:
 
 
 class PaperExecutor:
-    """Simulated order executor with optional quick exits."""
 
     def __init__(
         self,
         client: KalshiClient,
         conn: sqlite3.Connection,
         starting_cash: float = 1000.0,
-        profit_target: float = QUICK_PROFIT_TARGET,
+        profit_target: float = PROFIT_ACTIVATION,
     ):
         self.client = client
         self.conn = conn
@@ -67,57 +74,51 @@ class PaperExecutor:
 
         self.resting: list[RestingOrder] = []
         self._oid = itertools.count(1)
+
         self.profit_target = max(
             0.01, float(profit_target)
         )
 
+        # Tracks the highest estimated net profit
+        # per contract for each open position.
+        self.profit_peaks: dict[str, float] = {}
+
     def _new_id(self) -> str:
         return f"paper-{next(self._oid)}"
 
-    def _position(self, ticker: str) -> dict | None:
-        return state.get_positions(
-            self.conn, MODE
-        ).get(ticker)
-
-    def _reserved_cash(self) -> float:
-        """Estimated cash needed by resting bids."""
-        total = 0.0
+    def _reserved_cash(
+        self,
+        exclude: RestingOrder | None = None,
+    ) -> float:
+        reserved = 0.0
 
         for order in self.resting:
+            if order is exclude:
+                continue
+
             price = (
                 order.limit_price
                 if order.side == "yes"
                 else 1.0 - order.limit_price
             )
-            total += (
+
+            reserved += (
                 order.contracts * price
-                + taker_fee(price, order.contracts)
+                + taker_fee(
+                    price, order.contracts
+                )
             )
 
-        return total
+        return reserved
 
     def _can_afford(
         self,
         cost: float,
-        exclude_order: RestingOrder | None = None,
+        exclude: RestingOrder | None = None,
     ) -> bool:
-        reserved = self._reserved_cash()
-
-        if exclude_order is not None:
-            price = (
-                exclude_order.limit_price
-                if exclude_order.side == "yes"
-                else 1.0 - exclude_order.limit_price
-            )
-            reserved -= (
-                exclude_order.contracts * price
-                + taker_fee(
-                    price, exclude_order.contracts
-                )
-            )
-
         return cost <= max(
-            0.0, self.cash - reserved
+            0.0,
+            self.cash - self._reserved_cash(exclude),
         )
 
     async def execute(
@@ -126,12 +127,11 @@ class PaperExecutor:
         contracts: float,
         book: Book | None = None,
     ) -> PaperFill | None:
-        """Simulate a buy or park a limit bid."""
 
-        if (
-            contracts < MIN_CONTRACTS
-            or sig.side not in ("yes", "no")
-        ):
+        if contracts < 1:
+            return None
+
+        if sig.side not in ("yes", "no"):
             return None
 
         if book is None:
@@ -142,9 +142,7 @@ class PaperExecutor:
             )
 
         if sig.side == "yes":
-            level = (
-                book.asks[0] if book.asks else None
-            )
+            level = book.asks[0] if book.asks else None
             marketable = (
                 level is not None
                 and (
@@ -153,9 +151,7 @@ class PaperExecutor:
                 )
             )
         else:
-            level = (
-                book.bids[0] if book.bids else None
-            )
+            level = book.bids[0] if book.bids else None
             marketable = (
                 level is not None
                 and (
@@ -168,16 +164,19 @@ class PaperExecutor:
             yes_price, available = level
             qty = min(contracts, available)
 
-            if qty < MIN_CONTRACTS:
+            if qty < 1:
                 return None
 
-            side_price = (
+            price = (
                 yes_price
                 if sig.side == "yes"
                 else 1.0 - yes_price
             )
-            fee = taker_fee(side_price, qty)
-            cost = qty * side_price + fee
+
+            cost = (
+                qty * price
+                + taker_fee(price, qty)
+            )
 
             if not self._can_afford(cost):
                 return None
@@ -197,24 +196,22 @@ class PaperExecutor:
         if not 0 < sig.limit_price < 1:
             return None
 
-        side_price = (
+        price = (
             sig.limit_price
             if sig.side == "yes"
             else 1.0 - sig.limit_price
         )
 
-        estimated_cost = (
-            contracts * side_price
-            + taker_fee(side_price, contracts)
+        cost = (
+            contracts * price
+            + taker_fee(price, contracts)
         )
 
-        if not self._can_afford(estimated_cost):
+        if not self._can_afford(cost):
             return None
 
         order = RestingOrder(
-            order_id=(
-                f"paper-rest-{next(self._oid)}"
-            ),
+            order_id=f"paper-rest-{next(self._oid)}",
             ticker=sig.ticker,
             side=sig.side,
             contracts=contracts,
@@ -225,12 +222,12 @@ class PaperExecutor:
         self.resting.append(order)
 
         return PaperFill(
-            ticker=sig.ticker,
-            side=sig.side,
-            contracts=contracts,
-            price=0.0,
-            yes_price=sig.limit_price,
-            fee=0.0,
+            sig.ticker,
+            sig.side,
+            contracts,
+            0.0,
+            sig.limit_price,
+            0.0,
             resting=True,
         )
 
@@ -238,62 +235,56 @@ class PaperExecutor:
         self,
         books: dict[str, Book],
     ) -> list[PaperFill]:
-        """Simulate fills for resting limit orders."""
 
         fills = []
-        remaining_orders = []
+        remaining = []
 
         for order in self.resting:
             book = books.get(order.ticker)
 
             if book is None:
-                remaining_orders.append(order)
+                remaining.append(order)
                 continue
 
             if order.side == "yes":
-                level = (
-                    book.asks[0] if book.asks else None
-                )
+                level = book.asks[0] if book.asks else None
                 crossed = (
                     level is not None
                     and level[0] <= order.limit_price
                 )
             else:
-                level = (
-                    book.bids[0] if book.bids else None
-                )
+                level = book.bids[0] if book.bids else None
                 crossed = (
                     level is not None
                     and level[0] >= order.limit_price
                 )
 
             if not crossed:
-                remaining_orders.append(order)
+                remaining.append(order)
                 continue
 
             _, available = level
-            qty = min(
-                order.contracts, available
-            )
+            qty = min(order.contracts, available)
 
-            if qty < MIN_CONTRACTS:
-                remaining_orders.append(order)
+            if qty < 1:
+                remaining.append(order)
                 continue
 
-            yes_price = order.limit_price
-            side_price = (
-                yes_price
+            price = (
+                order.limit_price
                 if order.side == "yes"
-                else 1.0 - yes_price
+                else 1.0 - order.limit_price
             )
 
-            fee = maker_fee(side_price, qty)
-            cost = qty * side_price + fee
+            cost = (
+                qty * price
+                + maker_fee(price, qty)
+            )
 
             if not self._can_afford(
-                cost, exclude_order=order
+                cost, exclude=order
             ):
-                remaining_orders.append(order)
+                remaining.append(order)
                 continue
 
             fills.append(
@@ -301,7 +292,7 @@ class PaperExecutor:
                     order.ticker,
                     order.side,
                     qty,
-                    yes_price,
+                    order.limit_price,
                     order.strategy,
                     taker=False,
                     order_id=order.order_id,
@@ -310,11 +301,11 @@ class PaperExecutor:
 
             leftover = order.contracts - qty
 
-            if leftover >= MIN_CONTRACTS:
+            if leftover >= 1:
                 order.contracts = leftover
-                remaining_orders.append(order)
+                remaining.append(order)
 
-        self.resting = remaining_orders
+        self.resting = remaining
         return fills
 
     def _fill(
@@ -327,22 +318,20 @@ class PaperExecutor:
         taker: bool,
         order_id: str = "",
     ) -> PaperFill:
-        """Record a simulated opening purchase."""
 
-        side_price = (
+        price = (
             yes_price
             if side == "yes"
             else round(1.0 - yes_price, 4)
         )
 
-        fee_fn = (
-            taker_fee if taker else maker_fee
+        fee = (
+            taker_fee(price, qty)
+            if taker
+            else maker_fee(price, qty)
         )
-        fee = fee_fn(side_price, qty)
 
-        self.cash -= (
-            qty * side_price + fee
-        )
+        self.cash -= qty * price + fee
 
         state.record_fill(
             self.conn,
@@ -351,43 +340,109 @@ class PaperExecutor:
             ticker,
             side,
             qty,
-            side_price,
+            price,
             fee,
-            order_id=(
-                order_id or self._new_id()
-            ),
+            order_id=order_id or self._new_id(),
         )
 
-        signed = (
-            qty if side == "yes" else -qty
-        )
+        signed_qty = qty if side == "yes" else -qty
 
         state.apply_fill_to_position(
             self.conn,
             MODE,
             ticker,
-            signed,
+            signed_qty,
             yes_price,
             strategy,
         )
 
+        # A new entry changes the average cost basis.
+        self.profit_peaks.pop(ticker, None)
+
         return PaperFill(
-            ticker=ticker,
-            side=side,
-            contracts=qty,
-            price=side_price,
-            yes_price=yes_price,
-            fee=fee,
+            ticker,
+            side,
+            qty,
+            price,
+            yes_price,
+            fee,
         )
+
+    def _exit_quote(
+        self,
+        ticker: str,
+        position: dict,
+        book: Book,
+    ) -> dict | None:
+
+        signed_qty = float(position["contracts"])
+
+        if signed_qty == 0:
+            return None
+
+        is_yes = signed_qty > 0
+
+        if is_yes:
+            if not book.bids:
+                return None
+
+            yes_price, available = book.bids[0]
+            exit_price = yes_price
+            entry_price = float(
+                position["avg_price"]
+            )
+
+        else:
+            if not book.asks:
+                return None
+
+            yes_price, available = book.asks[0]
+            exit_price = 1.0 - yes_price
+            entry_price = (
+                1.0 - float(position["avg_price"])
+            )
+
+        qty = min(abs(signed_qty), available)
+
+        if qty < 1:
+            return None
+
+        # Estimate both sides' taker fees.
+        entry_fee = taker_fee(entry_price, qty)
+        exit_fee = taker_fee(exit_price, qty)
+
+        net_profit = (
+            (exit_price - entry_price) * qty
+            - entry_fee
+            - exit_fee
+        )
+
+        return {
+            "ticker": ticker,
+            "side": "yes" if is_yes else "no",
+            "contracts": qty,
+            "yes_price": yes_price,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "exit_fee": exit_fee,
+            "estimated_net_profit": net_profit,
+            "profit_per_contract": net_profit / qty,
+            "strategy": (
+                position.get("strategy")
+                or "quick_profit"
+            ),
+        }
 
     def quick_profit_opportunities(
         self,
         books: dict[str, Book],
     ) -> list[dict]:
-        """Find positions with sufficient estimated profit.
+        """Find trailing-profit exits.
 
-        Uses executable bid prices and available size,
-        not the midpoint or last traded price.
+        Start trailing at 20 cents net per contract.
+        Hold while profit makes new highs.
+        Exit after a 5-cent decline from the peak,
+        if the estimated exit remains profitable.
         """
 
         opportunities = []
@@ -395,99 +450,48 @@ class PaperExecutor:
             self.conn, MODE
         )
 
+        for ticker in list(self.profit_peaks):
+            if ticker not in positions:
+                self.profit_peaks.pop(ticker, None)
+
         for ticker, position in positions.items():
-            signed_qty = float(
-                position["contracts"]
-            )
-
-            if abs(signed_qty) < MIN_CONTRACTS:
-                continue
-
             book = books.get(ticker)
 
             if book is None:
                 continue
 
-            is_yes = signed_qty > 0
-
-            if is_yes:
-                if not book.bids:
-                    continue
-
-                yes_price, available = (
-                    book.bids[0]
-                )
-                entry_price = float(
-                    position["avg_price"]
-                )
-                exit_price = yes_price
-
-            else:
-                if not book.asks:
-                    continue
-
-                yes_price, available = (
-                    book.asks[0]
-                )
-                entry_price = (
-                    1.0
-                    - float(
-                        position["avg_price"]
-                    )
-                )
-                exit_price = (
-                    1.0 - yes_price
-                )
-
-            qty = min(
-                abs(signed_qty), available
+            quote = self._exit_quote(
+                ticker, position, book
             )
 
-            if qty < MIN_CONTRACTS:
+            if quote is None:
                 continue
 
-            entry_fee = taker_fee(
-                entry_price, qty
-            )
-            exit_fee = taker_fee(
-                exit_price, qty
+            current_profit = quote[
+                "profit_per_contract"
+            ]
+
+            old_peak = self.profit_peaks.get(
+                ticker, float("-inf")
             )
 
-            net_profit = (
-                (exit_price - entry_price) * qty
-                - entry_fee
-                - exit_fee
-            )
+            peak = max(old_peak, current_profit)
 
-            net_per_contract = (
-                net_profit / qty
-            )
+            if peak >= self.profit_target:
+                self.profit_peaks[ticker] = peak
+
+            if peak < self.profit_target:
+                continue
+
+            decline = peak - current_profit
 
             if (
-                net_per_contract
-                < self.profit_target
+                decline >= PROFIT_TRAIL
+                and current_profit >= MIN_EXIT_PROFIT
             ):
-                continue
-
-            opportunities.append({
-                "ticker": ticker,
-                "side": (
-                    "yes" if is_yes else "no"
-                ),
-                "contracts": qty,
-                "yes_price": yes_price,
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "exit_fee": exit_fee,
-                "estimated_net_profit": net_profit,
-                "profit_per_contract": (
-                    net_per_contract
-                ),
-                "strategy": (
-                    position.get("strategy")
-                    or "quick_profit"
-                ),
-            })
+                quote["peak_profit_per_contract"] = peak
+                quote["trailing_decline"] = decline
+                opportunities.append(quote)
 
         return opportunities
 
@@ -495,13 +499,7 @@ class PaperExecutor:
         self,
         books: dict[str, Book],
     ) -> list[dict]:
-        """Simulate early exits on profitable positions.
-
-        Closing a YES position means selling YES.
-        Closing a NO position means selling NO.
-
-        These are accounting operations only.
-        """
+        """Close qualifying simulated positions only."""
 
         closed = []
 
@@ -509,45 +507,40 @@ class PaperExecutor:
             books
         ):
             ticker = item["ticker"]
-            qty = item["contracts"]
+            position = state.get_positions(
+                self.conn, MODE
+            ).get(ticker)
 
-            current = self._position(ticker)
-
-            if current is None:
+            if position is None:
                 continue
 
             signed_qty = float(
-                current["contracts"]
+                position["contracts"]
             )
+
+            qty = item["contracts"]
 
             if abs(signed_qty) < qty:
                 continue
 
             yes_price = item["yes_price"]
             exit_price = item["exit_price"]
-            exit_fee = item["exit_fee"]
+            fee = item["exit_fee"]
 
-            proceeds = (
-                qty * exit_price - exit_fee
-            )
+            proceeds = qty * exit_price - fee
 
             self.cash += proceeds
 
             closing_side = (
-                "no"
-                if signed_qty > 0
-                else "yes"
+                "no" if signed_qty > 0 else "yes"
             )
 
             signed_change = (
-                -qty
-                if signed_qty > 0
-                else qty
+                -qty if signed_qty > 0 else qty
             )
 
             strategy = (
-                item["strategy"]
-                + "_quick_exit"
+                item["strategy"] + "_trailing_exit"
             )
 
             state.record_fill(
@@ -558,7 +551,7 @@ class PaperExecutor:
                 closing_side,
                 qty,
                 exit_price,
-                exit_fee,
+                fee,
                 order_id=self._new_id(),
             )
 
@@ -570,6 +563,8 @@ class PaperExecutor:
                 yes_price,
                 strategy,
             )
+
+            self.profit_peaks.pop(ticker, None)
 
             closed.append({
                 **item,
@@ -583,33 +578,21 @@ class PaperExecutor:
         self,
         marks: dict[str, float],
     ) -> float:
-        """Record simulated account equity."""
+        """Record simulated cash plus open positions."""
 
         value = 0.0
 
-        positions = state.get_positions(
+        for ticker, position in state.get_positions(
             self.conn, MODE
-        )
-
-        for ticker, position in positions.items():
-            qty = float(
-                position["contracts"]
-            )
-            avg = float(
-                position["avg_price"]
-            )
-
-            mark = marks.get(ticker)
-
-            if mark is None:
-                mark = avg
+        ).items():
+            qty = float(position["contracts"])
+            avg = float(position["avg_price"])
+            mark = marks.get(ticker, avg)
 
             if qty >= 0:
                 value += qty * mark
             else:
-                value += (
-                    -qty * (1.0 - mark)
-                )
+                value += -qty * (1.0 - mark)
 
         exposure = state.total_exposure(
             self.conn, MODE
