@@ -1,10 +1,18 @@
+
+import os
 from enum import Enum
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "kalshi.db"
+
+DB_PATH = Path(
+    os.environ.get(
+        "KALSHI_DB_PATH",
+        str(PROJECT_ROOT / "data" / "kalshi.db"),
+    )
+).expanduser()
 
 
 class TradingMode(str, Enum):
@@ -17,17 +25,30 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     kalshi_api_key_id: str = ""
-    kalshi_private_key_path: Path = Path("~/.kalshi/kalshi-private-key.pem")
-    # demo environment uses separate credentials (generated at demo.kalshi.co)
+    kalshi_private_key_path: Path = Path(
+        "~/.kalshi/kalshi-private-key.pem"
+    )
+
+    # Demo environment uses separate credentials
     kalshi_demo_api_key_id: str = ""
-    kalshi_demo_private_key_path: Path = Path("~/.kalshi/keys/demo/demo-key.pem")
+    kalshi_demo_private_key_path: Path = Path(
+        "~/.kalshi/keys/demo/demo-key.pem"
+    )
 
-    def credentials_for(self, mode: "TradingMode") -> tuple[str, Path]:
+    def credentials_for(
+        self, mode: "TradingMode"
+    ) -> tuple[str, Path]:
         if mode == TradingMode.DEMO:
-            return self.kalshi_demo_api_key_id, self.kalshi_demo_private_key_path
-        return self.kalshi_api_key_id, self.kalshi_private_key_path
+            return (
+                self.kalshi_demo_api_key_id,
+                self.kalshi_demo_private_key_path,
+            )
+        return (
+            self.kalshi_api_key_id,
+            self.kalshi_private_key_path,
+        )
 
-    odds_api_key: str = ""  # the-odds-api.com; free tier 500 credits/month
+    odds_api_key: str = ""
 
     trading_mode: TradingMode = TradingMode.PAPER
     live_trading_ack: str = "no"
