@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     trading_mode: TradingMode = TradingMode.PAPER
     live_trading_ack: str = "no"
 
-    max_position_per_market: float = 50.0
-    max_daily_loss: float = 25.0
-    max_total_exposure: float = 300.0
+    max_position_per_market: float = 24.0
+    max_daily_loss: float = 100.0
+    max_total_exposure: float = 80.0
 
     @property
     def live_trading_allowed(self) -> bool:
