@@ -1,0 +1,2 @@
+
+worker: python -m kalshi_bot.execution.engine --mode paper --interval 60
